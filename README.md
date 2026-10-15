@@ -1,88 +1,74 @@
-## What is this? ##
+# MIDI Monitor Modern
 
-[MIDI Monitor](http://www.snoize.com/MIDIMonitor/) is a Mac OS X application for monitoring MIDI data as it goes in and out of the computer.
+An unofficial experimental version of [MIDI Monitor](https://www.snoize.com/MIDIMonitor/), based on [MIDIApps by Kurt Revis](https://github.com/krevis/MIDIApps).
 
-[SysEx Librarian](http://www.snoize.com/SysExLibrarian/) is a Mac OS X application for sending and receiving MIDI system exclusive (aka sysex) messages.
+This version focuses on making source selection more useful in setups with many MIDI ports. It moves the source list into a resizable sidebar while retaining the original MIDI monitoring engine.
 
-This is the source code for the two applications. You do *not* need any of this if you just want to use the apps. You need the source if you want to play with the code, customize the application, or use parts of the code in your own project.
+This project is independently maintained and is not affiliated with or endorsed by Kurt Revis or Snoize.
 
-The source code is Open Source under the BSD license. See LICENSE for the legal details.
+## What's changed
 
-The project is currently intended to be used with an up-to-date Xcode version, like Xcode 15.0 (with the MacOS 14.0 SDK).  If you need to run it on an earlier Xcode, try checking out older revisions.
+- Full-height source sidebar with an adjustable width of 240–650 points.
+- Search MIDI port names without changing which sources are being monitored.
+- Group checkboxes apply to the visible matches while searching.
+- Larger source rows, full-name tooltips, and selected-port and search-result counts.
+- Larger event table with monospaced text and alternating row backgrounds.
+- Separate controls to show or hide the sidebar and message filters.
+- Sidebar width and visibility are stored in MIDI Monitor documents.
 
-## How to build ##
+The repository also contains the original SysEx Librarian sources; this UI work targets MIDI Monitor.
 
-1. `git submodule update --init --recursive` 
-2. Open `MIDIApps.xcworkspace` with Xcode.
-3. Open `Configurations/Snoize-Signing.xcconfig` and change `DEVELOPMENT_TEAM` to the Team ID of your Apple Developer account. See the file for more details.
-4. In the "Scheme" popup menu in the toolbar, select either MIDI Monitor or SysEx Librarian.
-5. Build and run!
+## Run the preview
 
+Extract the release archive and open `MIDI-Monitor-Modern.app`.
 
-## What's inside ##
+The supplied preview is a locally signed build for Apple Silicon. It is not a notarized public release.
 
-Your source tree should look like this:
+## Build locally without downloads
 
-* Applications
-	* MIDIMonitor
-	* SysExLibrarian
-* Configurations
-* Frameworks
-	* SnoizeMIDI
-	* SnoizeMIDISpy
-* Third Party
-    * HexFiend
-* Updates
+Requirements: macOS, a full Xcode installation with its command-line tools configured, and Python 3. The preview was built with Xcode 27.0 and tested on macOS 27.0.1.
 
-### Applications/MIDIMonitor Applications/SysExLibrarian ###
+From this source directory, run:
 
-The source for the two apps. The project files are MIDIMonitor.xcodeproj and SysExLibrarian.xcodeproj; open them with Xcode.
+```sh
+python3 build-local.py
+```
 
-Both apps are Cocoa, and are written in Swift.
+The script builds an ARM64 Release app at:
 
-The apps rely on the other frameworks, described below.
+```text
+../outputs/MIDI-Monitor-Modern.app
+```
 
+It prepares a disposable copy of the source at `../work/local-build/source`. The original Xcode project files are preserved.
 
-### Frameworks/SnoizeMIDI ###
+This build path does not download external dependencies:
 
-A framework containing code for dealing with CoreMIDI in a Cocoa app:
+- SnoizeMIDI, SnoizeMIDISpy, and the MIDI monitoring driver are built from the included source.
+- Sparkle and SwiftLint are omitted, and automatic updates are disabled.
+- The message detail window uses a native, selectable hexadecimal text view instead of HexFiend. SysEx saving remains available.
+- The app uses a separate bundle identifier: `de.verstaerker.MIDIMonitor.Sidebar`.
 
-* Finding MIDI devices, sources, and destinations
-* Creating "streams" of input and output data
-* Hooking them up to inputs and outputs
-* Parsing incoming MIDI data into separate messages
+## Standard Xcode build
 
-This framework is used by both apps. You can use it in your own apps as well.
+The original Xcode projects still use Sparkle, the HexFiend submodule, and SwiftLint. These dependencies are not fully included in a GitHub source ZIP.
 
+For the upstream build instructions and repository layout, see [README.upstream.md](README.upstream.md). The local preview build above is the reproducible build path for this version; the standard upstream build has not been verified for this fork and retains upstream signing and updater settings.
 
-### Frameworks/SnoizeMIDISpy ###
+## Current status
 
-This project builds two things: A CoreMIDI driver, and a framework.
+This is an early working preview, not a comprehensive rewrite.
 
-The CoreMIDI driver can "spy" on the MIDI sent to any destination in the system by any app.  (See the MIDIDriverEnableMonitoring() function in CoreMIDIServer/MIDIDriver.h for more details.)  The driver can then pass the MIDI data to another application.
+The ARM64 build and local code signature were verified. Testing covered real incoming MIDI Clock and controller messages, source search (including no matches and clearing the search), showing and hiding filters and the sidebar, and changing sidebar width. Changes to the available MIDI ports are reflected in the source list.
 
-The framework is used by apps that want to spy. It manages the communication between the app and the driver, and provides the app with an easy way to install the CoreMIDI driver when necessary.
+A complete regression test of document handling, SysEx operations, and output monitoring has not yet been performed.
 
-This code is currently only used by MIDI Monitor, but it could be useful in other contexts. MIDI Monitor contains some code to channel the "spy" MIDI data into the rest of the SnoizeMIDI stream system, so it acts just like any other MIDI source.
+## Credits and license
 
-The driver is written in C++, and the framework is C and Objective-C. You should be able to easily use the code from an application.
+Original MIDI Monitor and MIDIApps: Copyright (c) 2001–2023, Kurt Revis.
 
-### Configurations ###
+The original project is distributed under the BSD 3-Clause license. Its copyright notices, license conditions, and warranty disclaimer are retained in [LICENSE](LICENSE) and the source files. See that file for the complete terms.
 
-Contains .xcconfig files used to coordinate build settings across all the Xcode projects.
+Source redistribution must retain those notices and terms. Binary distributions must reproduce them in the accompanying documentation or other materials. The original copyright holder's or contributors' names may not be used to imply endorsement without prior written permission.
 
-### Third Party ###
-
-Contains the git submodule for HexFiend, which we use to display hex dumps in various views.
-
-If you don't see the HexFiend submodule, do `git submodule update --init --recursive`.
-
-### Updates ###
-
-Contains the server-side files used to make app updates work (via Sparkle). You don't need to touch these. 
-
-Note that the app targets use Sparkle as a package dependency via Swift Package Manager. Xcode should automatically get the package for you.
-
-## Questions? ##
-
-Please contact Kurt Revis <krevis@snoize.com> with any questions.
+Any third-party components included in other build configurations remain subject to their respective licenses.
