@@ -33,6 +33,19 @@ class MonitorWindowController: NSWindowController {
     @IBOutlet private var sourcesDisclosableView: DisclosableView!
     @IBOutlet private var sourcesOutlineView: SourcesOutlineView!
 
+    private let splitController = NSSplitViewController()
+    private var sidebarItem: NSSplitViewItem!
+    private let sourceSearchField = NSSearchField()
+    private let sourceSummary = NSTextField(labelWithString: "")
+    private var visibleSourceGroups: [CombinationInputStreamSourceGroup] = []
+    private var visibleSourceBoxes: [ObjectIdentifier: [Box<InputStreamSource>]] = [:]
+    private var hasLoadedSources = false
+    private var expandedSourceGroups = Set<ObjectIdentifier>()
+    private var previousSourceQuery = ""
+    private var filterIsShown = false
+    private var filterHeightConstraint: NSLayoutConstraint?
+    private var sidebarWidth: CGFloat = 340
+
     // Filter controls
     @IBOutlet private var filterDisclosureButton: DisclosureButton!
     @IBOutlet private var filterDisclosableView: DisclosableView!
@@ -108,6 +121,7 @@ extension MonitorWindowController {
         messagesTableView.target = self
         messagesTableView.doubleAction = #selector(self.showDetailsOfSelectedMessages(_:))
 
+        configureModernLayout()
         hideSysExProgressIndicator()
     }
 
@@ -183,13 +197,14 @@ extension MonitorWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
         guard let midiDocument else { return }
 
         inputSourceGroups = midiDocument.inputSourceGroups
-        sourcesOutlineView.reloadData()
+        reloadVisibleSources()
     }
 
     func revealInputSources(_ sources: Set<InputStreamSource>) {
         // Show the sources first
-        sourcesDisclosableView.shown = true
-        sourcesDisclosureButton.intValue = 1
+        sidebarItem.isCollapsed = false
+        sourceSearchField.stringValue = ""
+        reloadVisibleSources()
 
         // Of all of the input sources, find the first one which is in the given set.
         // Then expand the outline view to show this source, and scroll it to be visible.
@@ -209,16 +224,23 @@ extension MonitorWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
     }
 
     @IBAction func toggleSourcesShown(_ sender: Any?) {
-        sourcesDisclosableView.toggleDisclosure(sender)
+        if !sidebarItem.isCollapsed {
+            sidebarWidth = sidebarItem.viewController.view.frame.width
+        }
+        sidebarItem.isCollapsed.toggle()
+        if !sidebarItem.isCollapsed {
+            window?.contentView?.layoutSubtreeIfNeeded()
+            splitController.splitView.setPosition(sidebarWidth, ofDividerAt: 0)
+        }
         trivialWindowSettingsDidChange()
     }
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         if item == nil {
-            return inputSourceGroups.count
+            return visibleSourceGroups.count
         }
         else if let group = item as? CombinationInputStreamSourceGroup {
-            return group.boxedSources.count
+            return boxes(for: group).count
         }
         else {
             return 0
@@ -227,10 +249,10 @@ extension MonitorWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
 
     func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
         if item == nil {
-            return inputSourceGroups[index]
+            return visibleSourceGroups[index]
         }
         else if let group = item as? CombinationInputStreamSourceGroup {
-            return group.boxedSources[index]
+            return boxes(for: group)[index]
         }
         else {
             fatalError()
@@ -264,7 +286,7 @@ extension MonitorWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
 
         case "enabled":
             if let group = item as? CombinationInputStreamSourceGroup {
-                return buttonStateForInputSources(group.sources)
+                return buttonStateForInputSources(boxes(for: group).map { $0.unbox })
             }
             else if let source = item as? Box<InputStreamSource> {
                 return buttonStateForInputSources([source.unbox])
@@ -291,7 +313,7 @@ extension MonitorWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
 
         let sources: [InputStreamSource]
         if let group = item as? CombinationInputStreamSourceGroup {
-            sources = group.sources
+            sources = boxes(for: group).map { $0.unbox }
         }
         else if let source = item as? Box<InputStreamSource> {
             sources = [source.unbox]
@@ -398,7 +420,7 @@ extension MonitorWindowController {
     }
 
     @IBAction func toggleFilterShown(_ sender: Any?) {
-        filterDisclosableView.toggleDisclosure(sender)
+        setFilterShown(!filterIsShown)
         trivialWindowSettingsDidChange()
     }
 
@@ -649,17 +671,15 @@ extension MonitorWindowController {
     private static let untitledFilterShownKey = "SMMUntitledIsFilterShown"
 
     static var windowSettingsKeys: [String] {
-        return [sourcesShownKey, filterShownKey, windowFrameKey, messagesScrollPointX, messagesScrollPointY]
+        return [sourcesShownKey, filterShownKey, windowFrameKey, messagesScrollPointX, messagesScrollPointY, "sidebarWidth", "sidebarLayoutVersion"]
     }
 
     var windowSettings: [String: Any] {
         var windowSettings: [String: Any] = [:]
 
         // Remember whether our sections are shown or hidden
-        if sourcesDisclosableView.shown {
-            windowSettings[Self.sourcesShownKey] = NSNumber(value: true)
-        }
-        if filterDisclosableView.shown {
+        windowSettings[Self.sourcesShownKey] = NSNumber(value: !sidebarItem.isCollapsed)
+        if filterIsShown {
             windowSettings[Self.filterShownKey] = NSNumber(value: true)
         }
 
@@ -676,6 +696,11 @@ extension MonitorWindowController {
             windowSettings[Self.messagesScrollPointY] = NSNumber(value: Double(scrollPoint.y))
         }
 
+        if !sidebarItem.isCollapsed {
+            sidebarWidth = sidebarItem.viewController.view.frame.width
+        }
+        windowSettings["sidebarWidth"] = sidebarWidth
+        windowSettings["sidebarLayoutVersion"] = 1
         return windowSettings
     }
 
@@ -691,19 +716,26 @@ extension MonitorWindowController {
         // - plus any AppKit adjustments like cascading
         let originalFrameDescriptor = window.frameDescriptor
 
-        // Restore visibility of disclosable sections
-        let sourcesShown = (windowSettings[Self.sourcesShownKey] as? NSNumber)?.boolValue ?? UserDefaults.standard.bool(forKey: Self.untitledSourcesShownKey)
-        sourcesDisclosureButton.intValue = sourcesShown ? 1 : 0
-        sourcesDisclosableView.shown = sourcesShown
-
-        let filterShown = (windowSettings[Self.filterShownKey] as? NSNumber)?.boolValue ?? UserDefaults.standard.bool(forKey: Self.untitledFilterShownKey)
-        filterDisclosureButton.intValue = filterShown ? 1 : 0
-        filterDisclosableView.shown = filterShown
+        // Old documents used a short, vertically collapsing source panel.
+        // Start the new layout with its sidebar visible when migrating them.
+        let isSidebarLayout = windowSettings["sidebarLayoutVersion"] as? Int == 1
+        sidebarItem.isCollapsed = isSidebarLayout && !((windowSettings[Self.sourcesShownKey] as? NSNumber)?.boolValue ?? true)
+        let filterShown = (windowSettings[Self.filterShownKey] as? NSNumber)?.boolValue ?? false
+        setFilterShown(filterShown)
 
         // Then, since those may have resized the window, set the frame back to what we expect.
         // (If we don't have a frame in the document, use the original frame.)
         let windowFrame = windowSettings[Self.windowFrameKey] as? NSWindow.PersistableFrameDescriptor ?? originalFrameDescriptor
         window.setFrame(from: windowFrame)
+        var frame = window.frame
+        frame.size.width = max(frame.width, window.minSize.width)
+        frame.size.height = max(frame.height, window.minSize.height)
+        window.setFrame(frame, display: false)
+        window.contentView?.layoutSubtreeIfNeeded()
+        sidebarWidth = CGFloat((windowSettings["sidebarWidth"] as? NSNumber)?.doubleValue ?? 340)
+        if !sidebarItem.isCollapsed {
+            splitController.splitView.setPosition(min(max(sidebarWidth, 240), max(240, splitController.splitView.bounds.width - 600)), ofDividerAt: 0)
+        }
 
         if let scrollX = windowSettings[Self.messagesScrollPointX] as? NSNumber,
            let scrollY = windowSettings[Self.messagesScrollPointY] as? NSNumber {
@@ -754,9 +786,238 @@ extension MonitorWindowController: FastAnimatingWindowDelegate {
             // Also save whether each disclosable section is shown, since we want to
             // restore them all together in a new document in order to be coherent
             let defaults = UserDefaults.standard
-            defaults.setValue(sourcesDisclosableView.shown, forKey: Self.untitledSourcesShownKey)
-            defaults.setValue(filterDisclosableView.shown, forKey: Self.untitledFilterShownKey)
+            defaults.setValue(!sidebarItem.isCollapsed, forKey: Self.untitledSourcesShownKey)
+            defaults.setValue(filterIsShown, forKey: Self.untitledFilterShownKey)
         }
     }
 
+}
+
+// MARK: Sidebar layout
+
+extension MonitorWindowController: NSSearchFieldDelegate {
+
+    private func configureModernLayout() {
+        guard let window,
+              let sourcesScroll = sourcesOutlineView.enclosingScrollView,
+              let eventsScroll = messagesTableView.enclosingScrollView else { return }
+
+        // Retain the original controls, their bindings and their MIDI data sources.
+        // Only the layout is replaced; the MIDI pipeline remains unchanged.
+        let progressContainer = sysExProgressIndicator.superview!
+        let controls: [NSView] = [sourcesScroll, eventsScroll, filterDisclosableView,
+                                  maxMessageCountField, clearButton, progressContainer]
+        for view in controls {
+            view.removeFromSuperview()
+            view.translatesAutoresizingMaskIntoConstraints = false
+        }
+
+        let sidebar = NSViewController()
+        let background = NSVisualEffectView()
+        background.material = .sidebar
+        background.blendingMode = .behindWindow
+        background.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.view = background
+        let heading = NSTextField(labelWithString: "Sources")
+        heading.font = .systemFont(ofSize: 15, weight: .semibold)
+        sourceSearchField.placeholderString = "Search MIDI ports"
+        sourceSearchField.delegate = self
+        sourceSearchField.sendsSearchStringImmediately = true
+        sourceSearchField.setAccessibilityLabel("Search MIDI ports")
+        sourceSummary.font = .systemFont(ofSize: 11)
+        sourceSummary.textColor = .secondaryLabelColor
+        sourceSummary.lineBreakMode = .byTruncatingTail
+
+        sourcesScroll.borderType = .noBorder
+        sourcesScroll.drawsBackground = false
+        sourcesScroll.hasVerticalScroller = true
+        sourcesScroll.autohidesScrollers = true
+        sourcesOutlineView.backgroundColor = .clear
+        sourcesOutlineView.rowHeight = 25
+        sourcesOutlineView.intercellSpacing = NSSize(width: 4, height: 2)
+        sourcesOutlineView.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        sourcesOutlineView.autoresizesOutlineColumn = true
+        sourcesOutlineView.setAccessibilityLabel("MIDI sources")
+        let nameColumn = sourcesOutlineView.tableColumn(withIdentifier: .init("name"))!
+        nameColumn.minWidth = 160
+        (nameColumn.dataCell as? NSTextFieldCell)?.font = .systemFont(ofSize: 12)
+        (nameColumn.dataCell as? NSTextFieldCell)?.lineBreakMode = .byTruncatingTail
+
+        for view in [heading, sourceSearchField, sourcesScroll, sourceSummary] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            background.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            heading.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 16),
+            heading.topAnchor.constraint(equalTo: background.topAnchor, constant: 18),
+            sourceSearchField.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 12),
+            sourceSearchField.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 12),
+            sourceSearchField.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
+            sourcesScroll.topAnchor.constraint(equalTo: sourceSearchField.bottomAnchor, constant: 12),
+            sourcesScroll.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 8),
+            sourcesScroll.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -8),
+            sourcesScroll.bottomAnchor.constraint(equalTo: sourceSummary.topAnchor, constant: -10),
+            sourceSummary.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 16),
+            sourceSummary.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -12),
+            sourceSummary.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -12)
+        ])
+
+        let detail = NSViewController()
+        detail.view = NSView()
+        detail.view.translatesAutoresizingMaskIntoConstraints = false
+        let header = NSView()
+        let sidebarButton = NSButton(image: NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Toggle sources")!, target: self, action: #selector(toggleSourcesShown(_:)))
+        sidebarButton.bezelStyle = .texturedRounded
+        sidebarButton.toolTip = "Show or hide MIDI sources"
+        let filterButton = NSButton(title: "Filters", target: self, action: #selector(toggleFilterShown(_:)))
+        filterButton.bezelStyle = .rounded
+        let title = NSTextField(labelWithString: "MIDI Events")
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        let limitLabel = NSTextField(labelWithString: "Event limit")
+        limitLabel.font = .systemFont(ofSize: 11)
+        limitLabel.textColor = .secondaryLabelColor
+        let footer = NSView()
+        let filterContainer = NSView()
+        filterContainer.addSubview(filterDisclosableView)
+        filterDisclosableView.autoresizesSubviews = false
+        filterHeightConstraint = filterContainer.heightAnchor.constraint(equalToConstant: 0)
+        filterHeightConstraint?.isActive = true
+        filterContainer.isHidden = true
+        filterDisclosableView.isHidden = true
+
+        for view in [header, filterContainer, eventsScroll, footer] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            detail.view.addSubview(view)
+        }
+        for view in [sidebarButton, title, filterButton, clearButton] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            header.addSubview(view)
+        }
+        for view in [limitLabel, maxMessageCountField, progressContainer] as [NSView] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            footer.addSubview(view)
+        }
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: detail.view.topAnchor),
+            header.leadingAnchor.constraint(equalTo: detail.view.leadingAnchor),
+            header.trailingAnchor.constraint(equalTo: detail.view.trailingAnchor),
+            header.heightAnchor.constraint(equalToConstant: 54),
+            sidebarButton.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 14),
+            sidebarButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            sidebarButton.widthAnchor.constraint(equalToConstant: 34),
+            title.leadingAnchor.constraint(equalTo: sidebarButton.trailingAnchor, constant: 12),
+            title.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            filterButton.trailingAnchor.constraint(equalTo: clearButton.leadingAnchor, constant: -8),
+            filterButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            clearButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+            clearButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            filterContainer.topAnchor.constraint(equalTo: header.bottomAnchor),
+            filterContainer.leadingAnchor.constraint(equalTo: detail.view.leadingAnchor),
+            filterContainer.trailingAnchor.constraint(equalTo: detail.view.trailingAnchor),
+            filterDisclosableView.topAnchor.constraint(equalTo: filterContainer.topAnchor),
+            filterDisclosableView.leadingAnchor.constraint(equalTo: filterContainer.leadingAnchor, constant: 16),
+            filterDisclosableView.widthAnchor.constraint(equalToConstant: 560),
+            filterDisclosableView.heightAnchor.constraint(equalToConstant: 193),
+            eventsScroll.topAnchor.constraint(equalTo: filterContainer.bottomAnchor),
+            eventsScroll.leadingAnchor.constraint(equalTo: detail.view.leadingAnchor),
+            eventsScroll.trailingAnchor.constraint(equalTo: detail.view.trailingAnchor),
+            eventsScroll.bottomAnchor.constraint(equalTo: footer.topAnchor),
+            footer.leadingAnchor.constraint(equalTo: detail.view.leadingAnchor),
+            footer.trailingAnchor.constraint(equalTo: detail.view.trailingAnchor),
+            footer.bottomAnchor.constraint(equalTo: detail.view.bottomAnchor),
+            footer.heightAnchor.constraint(equalToConstant: 40),
+            limitLabel.leadingAnchor.constraint(equalTo: footer.leadingAnchor, constant: 16),
+            limitLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            maxMessageCountField.leadingAnchor.constraint(equalTo: limitLabel.trailingAnchor, constant: 8),
+            maxMessageCountField.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            maxMessageCountField.widthAnchor.constraint(equalToConstant: 80),
+            progressContainer.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -16),
+            progressContainer.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            progressContainer.widthAnchor.constraint(equalToConstant: 115),
+            progressContainer.heightAnchor.constraint(equalToConstant: 18)
+        ])
+
+        eventsScroll.hasHorizontalScroller = true
+        eventsScroll.autohidesScrollers = true
+        messagesTableView.rowHeight = 23
+        messagesTableView.usesAlternatingRowBackgroundColors = true
+        for column in messagesTableView.tableColumns {
+            (column.dataCell as? NSTextFieldCell)?.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        }
+        messagesTableView.tableColumn(withIdentifier: .init("source"))?.width = 200
+        messagesTableView.tableColumn(withIdentifier: .init("timeStamp"))?.width = 110
+
+        sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
+        sidebarItem.minimumThickness = 240
+        sidebarItem.maximumThickness = 650
+        sidebarItem.canCollapse = true
+        sidebarItem.holdingPriority = NSLayoutConstraint.Priority(260)
+        sidebarItem.preferredThicknessFraction = 0.275
+        sidebarItem.canCollapseFromWindowResize = false
+        sidebarItem.collapseBehavior = .preferResizingSiblingsWithFixedSplitView
+        let detailItem = NSSplitViewItem(viewController: detail)
+        detailItem.minimumThickness = 600
+        splitController.addSplitViewItem(sidebarItem)
+        splitController.addSplitViewItem(detailItem)
+        splitController.splitView.dividerStyle = .thin
+        window.contentViewController = splitController
+        window.contentMinSize = NSSize(width: 860, height: 480)
+        window.setContentSize(NSSize(width: 1240, height: 760))
+        window.titlebarAppearsTransparent = true
+        window.autorecalculatesKeyViewLoop = true
+        window.initialFirstResponder = sourcesOutlineView
+        window.contentView?.layoutSubtreeIfNeeded()
+        splitController.splitView.setPosition(sidebarWidth, ofDividerAt: 0)
+    }
+
+    private func setFilterShown(_ shown: Bool) {
+        filterIsShown = shown
+        filterDisclosableView.isHidden = !shown
+        filterDisclosableView.superview?.isHidden = !shown
+        filterHeightConstraint?.constant = shown ? 201 : 0
+    }
+
+    private func boxes(for group: CombinationInputStreamSourceGroup) -> [Box<InputStreamSource>] {
+        visibleSourceBoxes[ObjectIdentifier(group)] ?? []
+    }
+
+    private func reloadVisibleSources() {
+        if hasLoadedSources && previousSourceQuery.isEmpty {
+            expandedSourceGroups = Set(inputSourceGroups.filter { sourcesOutlineView.isItemExpanded($0) }.map { ObjectIdentifier($0) })
+        }
+        let query = sourceSearchField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        visibleSourceBoxes.removeAll()
+        visibleSourceGroups = inputSourceGroups.filter { group in
+            let matches = group.boxedSources.filter {
+                query.isEmpty || group.name.localizedStandardContains(query) || ($0.unbox.name ?? "").localizedStandardContains(query)
+            }
+            visibleSourceBoxes[ObjectIdentifier(group)] = matches
+            return query.isEmpty || !matches.isEmpty
+        }
+        sourcesOutlineView.reloadData()
+        for group in visibleSourceGroups where group.expandable {
+            if !hasLoadedSources || !query.isEmpty || expandedSourceGroups.contains(ObjectIdentifier(group)) {
+                sourcesOutlineView.expandItem(group)
+            }
+        }
+        if !hasLoadedSources {
+            expandedSourceGroups = Set(inputSourceGroups.map { ObjectIdentifier($0) })
+        }
+        previousSourceQuery = query
+        if !inputSourceGroups.isEmpty { hasLoadedSources = true }
+        let total = inputSourceGroups.reduce(0) { $0 + $1.sources.count }
+        let selected = midiDocument?.selectedInputSources.count ?? 0
+        let visible = visibleSourceGroups.reduce(0) { $0 + boxes(for: $1).count }
+        sourceSummary.stringValue = query.isEmpty ? "\(selected) selected · \(total) ports" : "\(visible) matches · \(selected) selected"
+    }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard notification.object as? NSSearchField === sourceSearchField else { return }
+        reloadVisibleSources()
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, toolTipFor cell: NSCell, rect: NSRectPointer, tableColumn: NSTableColumn?, item: Any, mouseLocation: NSPoint) -> String {
+        if let group = item as? CombinationInputStreamSourceGroup { return group.name }
+        return (item as? Box<InputStreamSource>)?.unbox.name ?? ""
+    }
 }
