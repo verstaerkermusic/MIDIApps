@@ -34,6 +34,14 @@ class MonitorWindowController: NSWindowController {
     @IBOutlet private var sourcesOutlineView: SourcesOutlineView!
 
     private let splitController = NSSplitViewController()
+    private let clockLabel = NSTextField(labelWithString: "— BPM")
+    private var clockTimer: Timer?
+    private let clockSourceMenu = NSPopUpButton(frame: .zero, pullsDown: false)
+
+    deinit {
+        clockTimer?.invalidate()
+    }
+
     private var sidebarItem: NSSplitViewItem!
     private let sourceSearchField = NSSearchField()
     private let sourceSummary = NSTextField(labelWithString: "")
@@ -198,6 +206,7 @@ extension MonitorWindowController: NSOutlineViewDataSource, NSOutlineViewDelegat
 
         inputSourceGroups = midiDocument.inputSourceGroups
         reloadVisibleSources()
+        updateClockSources()
     }
 
     func revealInputSources(_ sources: Set<InputStreamSource>) {
@@ -873,6 +882,23 @@ extension MonitorWindowController: NSSearchFieldDelegate {
         filterButton.bezelStyle = .rounded
         let title = NSTextField(labelWithString: "MIDI Events")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
+        clockLabel.font = .monospacedDigitSystemFont(ofSize: 15, weight: .semibold)
+        clockLabel.textColor = .secondaryLabelColor
+        updateClockDisplay()
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            self?.updateClockDisplay()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        clockTimer = timer
+        let clockSourceLabel = NSTextField(labelWithString: "Clock Source")
+        clockSourceLabel.font = .systemFont(ofSize: 11)
+        clockSourceLabel.textColor = .secondaryLabelColor
+        clockSourceMenu.controlSize = .small
+        clockSourceMenu.autoenablesItems = false
+        clockSourceMenu.setAccessibilityLabel("MIDI Clock Source")
+        clockSourceMenu.target = self
+        clockSourceMenu.action = #selector(changeClockSource(_:))
+        updateClockSources()
         let limitLabel = NSTextField(labelWithString: "Event limit")
         limitLabel.font = .systemFont(ofSize: 11)
         limitLabel.textColor = .secondaryLabelColor
@@ -889,11 +915,11 @@ extension MonitorWindowController: NSSearchFieldDelegate {
             view.translatesAutoresizingMaskIntoConstraints = false
             detail.view.addSubview(view)
         }
-        for view in [sidebarButton, title, filterButton, clearButton] as [NSView] {
+        for view in [sidebarButton, title, clockLabel, filterButton, clearButton] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             header.addSubview(view)
         }
-        for view in [limitLabel, maxMessageCountField, progressContainer] as [NSView] {
+        for view in [limitLabel, maxMessageCountField, clockSourceLabel, clockSourceMenu, progressContainer] as [NSView] {
             view.translatesAutoresizingMaskIntoConstraints = false
             footer.addSubview(view)
         }
@@ -907,6 +933,8 @@ extension MonitorWindowController: NSSearchFieldDelegate {
             sidebarButton.widthAnchor.constraint(equalToConstant: 34),
             title.leadingAnchor.constraint(equalTo: sidebarButton.trailingAnchor, constant: 12),
             title.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            clockLabel.centerXAnchor.constraint(equalTo: header.centerXAnchor),
+            clockLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             filterButton.trailingAnchor.constraint(equalTo: clearButton.leadingAnchor, constant: -8),
             filterButton.centerYAnchor.constraint(equalTo: header.centerYAnchor),
             clearButton.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
@@ -931,6 +959,11 @@ extension MonitorWindowController: NSSearchFieldDelegate {
             maxMessageCountField.leadingAnchor.constraint(equalTo: limitLabel.trailingAnchor, constant: 8),
             maxMessageCountField.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             maxMessageCountField.widthAnchor.constraint(equalToConstant: 80),
+            clockSourceLabel.leadingAnchor.constraint(equalTo: maxMessageCountField.trailingAnchor, constant: 20),
+            clockSourceLabel.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            clockSourceMenu.leadingAnchor.constraint(equalTo: clockSourceLabel.trailingAnchor, constant: 8),
+            clockSourceMenu.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
+            clockSourceMenu.widthAnchor.constraint(equalToConstant: 175),
             progressContainer.trailingAnchor.constraint(equalTo: footer.trailingAnchor, constant: -16),
             progressContainer.centerYAnchor.constraint(equalTo: footer.centerYAnchor),
             progressContainer.widthAnchor.constraint(equalToConstant: 115),
@@ -968,6 +1001,53 @@ extension MonitorWindowController: NSSearchFieldDelegate {
         window.initialFirstResponder = sourcesOutlineView
         window.contentView?.layoutSubtreeIfNeeded()
         splitController.splitView.setPosition(sidebarWidth, ofDividerAt: 0)
+    }
+
+    private func updateClockSources() {
+        clockSourceMenu.removeAllItems()
+        clockSourceMenu.addItem(withTitle: "Auto")
+        guard let midiDocument else { return }
+
+        let sources = midiDocument.selectedInputSources
+            .sorted { ($0.name ?? "").localizedStandardCompare($1.name ?? "") == .orderedAscending }
+        for source in sources {
+            guard let id = source.uniqueID else { continue }
+            let name = source.name ?? "Unnamed MIDI Port"
+            let title = clockSourceMenu.item(withTitle: name) == nil ? name : "\(name) [\(id)]"
+            clockSourceMenu.addItem(withTitle: title)
+            clockSourceMenu.lastItem?.representedObject = NSNumber(value: id)
+        }
+
+        let selectedIndex = clockSourceMenu.itemArray.firstIndex {
+            ($0.representedObject as? NSNumber)?.int32Value == midiDocument.clockSourceID
+        }
+        clockSourceMenu.selectItem(at: selectedIndex ?? 0)
+        if selectedIndex == nil { midiDocument.clockSourceID = nil }
+        updateClockDisplay()
+    }
+
+    @objc private func changeClockSource(_ sender: NSPopUpButton) {
+        midiDocument?.clockSourceID = (sender.selectedItem?.representedObject as? NSNumber)?.int32Value
+        updateClockDisplay()
+    }
+
+    private func updateClockDisplay() {
+        let clock = midiDocument?.midiClockDisplay
+        let text = clock?.bpm.map { String(format: "%.1f BPM", $0) } ?? "— BPM"
+        let color: NSColor
+        let status: String
+        if let clock {
+            color = clock.running ? .systemGreen : .systemRed
+            status = clock.running ? "MIDI clock running" : "MIDI clock stopped"
+        } else {
+            color = .secondaryLabelColor
+            status = "Waiting for MIDI clock"
+        }
+        if clockLabel.stringValue != text { clockLabel.stringValue = text }
+        if clockLabel.textColor != color { clockLabel.textColor = color }
+        let description = clock?.source.map { "\(status) · \($0)" } ?? status
+        clockLabel.toolTip = description
+        clockLabel.setAccessibilityLabel("\(text), \(description)")
     }
 
     private func setFilterShown(_ shown: Bool) {

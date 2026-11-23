@@ -6,6 +6,7 @@
  */
 
 import Cocoa
+import CoreAudio
 import SnoizeMIDI
 
 class Document: NSDocument {
@@ -19,7 +20,7 @@ class Document: NSDocument {
         updateVirtualEndpointName()
 
         stream.delegate = self
-        stream.messageDestination = messageFilter
+        stream.messageDestination = self
         messageFilter.filterMask = Message.TypeMask.all
         messageFilter.channelMask = VoiceMessage.ChannelMask.all
 
@@ -50,6 +51,27 @@ class Document: NSDocument {
     private let stream: CombinationInputStream
     private let messageFilter = MessageFilter()
     private let history = MessageHistory()
+
+    private struct ClockState {
+        var lastTick: UInt64?
+        var lastArrival: TimeInterval?
+        var intervals: [Double] = []
+        var transportRunning: Bool?
+
+        var bpm: Double? {
+            guard intervals.count >= 6 else { return nil }
+            return 60 * Double(intervals.count) / (24 * intervals.reduce(0, +))
+        }
+
+        func hasRecentClock(at time: TimeInterval) -> Bool {
+            lastArrival.map { time - $0 < 1 } ?? false
+        }
+    }
+
+    private var clocks: [Endpoint?: ClockState] = [:]
+    private var displayedClock: Endpoint??
+    var clockSourceID: Int32?
+
 
     // Transient data
     private var isSysExUpdateQueued = false
@@ -289,6 +311,8 @@ extension Document {
         }
 
         stream.selectedInputSources = newValue
+        clocks.removeAll()
+        displayedClock = nil
         monitorWindowController?.updateSources()
     }
 
@@ -546,6 +570,8 @@ extension Document: CombinationInputStreamDelegate {
     }
 
     func combinationInputStreamSourceListChanged(_ stream: CombinationInputStream) {
+        clocks.removeAll()
+        displayedClock = nil
         monitorWindowController?.updateSources()
 
         // Also, it's possible that the endpoint names went from being unique to non-unique, so we need
@@ -562,4 +588,65 @@ extension Document: MessageHistoryDelegate {
         monitorWindowController?.updateMessages(scrollingToBottom: messagesWereAdded)
     }
 
+}
+
+
+extension Document: MessageDestination {
+    func takeMIDIMessages(_ messages: [Message]) {
+        let now = ProcessInfo.processInfo.systemUptime
+        for case let message as SystemRealTimeMessage in messages {
+            let endpoint = message.originatingEndpoint
+            var clock = clocks[endpoint] ?? ClockState()
+            switch message.type {
+            case .clock:
+                let tick = message.hostTimeStamp
+                if let previous = clock.lastTick, tick <= previous { continue }
+                if let previous = clock.lastTick, clock.hasRecentClock(at: now) {
+                    let interval = Double(AudioConvertHostTimeToNanos(tick - previous)) / 1e9
+                    if interval > 0, interval < 1 {
+                        clock.intervals.append(interval)
+                        if clock.intervals.count > 24 {
+                            clock.intervals.removeFirst()
+                        }
+                    }
+                } else {
+                    clock.intervals.removeAll(keepingCapacity: true)
+                }
+                clock.lastTick = tick
+                clock.lastArrival = now
+                if displayedClock == nil {
+                    displayedClock = .some(endpoint)
+                }
+            case .start, .continue:
+                clock.transportRunning = true
+            case .stop:
+                clock.transportRunning = false
+            case .reset:
+                clock = ClockState()
+            default:
+                continue
+            }
+            clocks[endpoint] = clock
+        }
+        messageFilter.takeMIDIMessages(messages)
+    }
+
+    var midiClockDisplay: (bpm: Double?, running: Bool, source: String?)? {
+        let now = ProcessInfo.processInfo.systemUptime
+        // Keep the current source while its clock is present. Never mix ticks from different ports.
+        let source: Endpoint??
+        if let clockSourceID {
+            source = clocks.keys.first { $0?.uniqueID == clockSourceID }
+        } else {
+            if let endpoint = displayedClock, clocks[endpoint]?.hasRecentClock(at: now) != true,
+               let replacement = clocks.first(where: { $0.value.hasRecentClock(at: now) }) {
+                displayedClock = .some(replacement.key)
+            }
+            source = displayedClock
+        }
+        guard let endpoint = source, let clock = clocks[endpoint], clock.lastTick != nil else {
+            return nil
+        }
+        return (clock.bpm, clock.transportRunning != false && clock.hasRecentClock(at: now), endpoint?.name)
+    }
 }
